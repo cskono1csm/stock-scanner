@@ -1,0 +1,36 @@
+name: Stock Screening
+
+on:
+  schedule:
+    - cron: "30 22 * * 0-4"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stock-screening
+  cancel-in-progress: false
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run screener (KR + US)
+        run: python main.py
+      - name: Commit updated dashboard
+        run: |
+          git config user.name "stock-screener-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "자동 갱신: $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
