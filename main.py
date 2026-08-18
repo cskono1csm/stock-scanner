@@ -36,7 +36,7 @@ try:
 except ImportError:
     yf = None
     
-    import requests
+import requests
 
 _orig_request = requests.sessions.Session.request
 def _patched_request(self, method, url, **kwargs):
