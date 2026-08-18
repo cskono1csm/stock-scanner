@@ -35,6 +35,7 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+    
     import requests
 
 _orig_request = requests.sessions.Session.request
