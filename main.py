@@ -130,7 +130,7 @@ def score_market(df: pd.DataFrame, extra_momentum=None, extra_dividend=None) -> 
 # 한국 시장 데이터 수집
 # ==========================================================
 def _latest_trading_day() -> str:
-    d = dt.date.today()
+    d = dt.date.today() - dt.timedelta(days=1)
     for i in range(10):
         cand = d - dt.timedelta(days=i)
         if cand.weekday() < 5:
@@ -142,25 +142,42 @@ def fetch_kr_fundamentals(markets=None) -> pd.DataFrame:
     if pykrx_stock is None:
         raise ImportError("pykrx가 설치되어 있지 않습니다.")
     markets = markets or KR_MARKETS
-    date = _latest_trading_day()
-    frames = []
-    for m in markets:
-        fundamental = pykrx_stock.get_market_fundamental(date, market=m)
-        cap = pykrx_stock.get_market_cap(date, market=m)
-        df = fundamental.join(cap, how="inner")
-        df["시장"] = m
-        frames.append(df)
-    result = pd.concat(frames)
-    result.index.name = "티커"
-    result = result.reset_index()
-    names = {}
-    for t in result["티커"]:
+    base_date = dt.datetime.strptime(_latest_trading_day(), "%Y%m%d").date()
+
+    last_err = None
+    for offset in range(7):
+        cand = base_date - dt.timedelta(days=offset)
+        if cand.weekday() >= 5:
+            continue
+        date_str = cand.strftime("%Y%m%d")
         try:
-            names[t] = pykrx_stock.get_market_ticker_name(t)
-        except Exception:
-            names[t] = t
-    result["종목명"] = result["티커"].map(names)
-    return result
+            frames = []
+            for m in markets:
+                fundamental = pykrx_stock.get_market_fundamental(date_str, market=m)
+                if fundamental is None or fundamental.empty:
+                    raise ValueError(f"{date_str} {m} 데이터 없음(공휴일 또는 미확정)")
+                cap = pykrx_stock.get_market_cap(date_str, market=m)
+                df = fundamental.join(cap, how="inner")
+                df["시장"] = m
+                frames.append(df)
+            result = pd.concat(frames)
+            result.index.name = "티커"
+            result = result.reset_index()
+            names = {}
+            for t in result["티커"]:
+                try:
+                    names[t] = pykrx_stock.get_market_ticker_name(t)
+                except Exception:
+                    names[t] = t
+            result["종목명"] = result["티커"].map(names)
+            print(f"[KR] {date_str} 기준 데이터 사용")
+            return result
+        except Exception as e:
+            last_err = e
+            print(f"[KR] {date_str} 수집 실패({e}) — 이전 거래일 재시도")
+            continue
+
+    raise RuntimeError(f"최근 7일 내 유효한 KR 데이터를 찾지 못했습니다: {last_err}")
 
 
 def fetch_kr_momentum(tickers, lookback_days=380) -> pd.DataFrame:
