@@ -35,6 +35,19 @@ try:
     import yfinance as yf
 except ImportError:
     yf = None
+    import requests
+
+_orig_request = requests.sessions.Session.request
+def _patched_request(self, method, url, **kwargs):
+    headers = kwargs.get("headers") or {}
+    headers.setdefault(
+        "User-Agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    )
+    kwargs["headers"] = headers
+    return _orig_request(self, method, url, **kwargs)
+requests.sessions.Session.request = _patched_request
 
 
 # ==========================================================
