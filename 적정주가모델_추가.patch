@@ -1,0 +1,259 @@
+diff --git a/main.py b/main.py
+index 51badd3..d0ae27d 100644
+--- a/main.py
++++ b/main.py
+@@ -68,6 +68,15 @@ PER_MAX = 60
+ PBR_MAX = 15
+ EXCLUDE_NEGATIVE_EARNINGS = True
+ 
++# 적정주가(상대가치평가) 추정 설정
++# - PER/PBR/EV-EBITDA 각 방식으로 "동종그룹(섹터 또는 시장) 중앙값 배수"를 적용해
++#   적정주가를 추정한 뒤, 아래 가중치로 가중평균합니다.
++# - 미래 현금흐름을 직접 추정하는 DCF가 아니라 "동종업종 대비 몇 배가 합리적인가"를
++#   보는 상대가치평가이므로, 업종 전체가 고평가/저평가된 국면에서는 왜곡될 수 있습니다.
++FAIR_VALUE_WEIGHTS = {"PER": 0.4, "PBR": 0.3, "EV_EBITDA": 0.3}
++FAIR_VALUE_MIN_PEER_GROUP = 5   # 섹터/시장 내 표본이 이 수 미만이면 상위 그룹 중앙값으로 대체
++FAIR_VALUE_MAX_UPSIDE = 3.0     # 괴리율 표시 상한(+300%) — 그 이상은 저신뢰로 간주해 클리핑
++
+ TOP_N = 30
+ OUTPUT_DIR = "output"
+ 
+@@ -140,6 +149,91 @@ def score_market(df: pd.DataFrame, extra_momentum=None, extra_dividend=None) ->
+     return df
+ 
+ 
++# ==========================================================
++# 적정주가(상대가치평가) 추정 로직
++# ==========================================================
++def _peer_group_median(df: pd.DataFrame, group_cols: list, value_col: str) -> pd.Series:
++    """그룹(섹터 등) 중앙값을 각 행에 매핑합니다.
++    그룹 표본 수가 FAIR_VALUE_MIN_PEER_GROUP 미만이면 전체 시장 중앙값으로 대체합니다."""
++    if value_col not in df.columns:
++        return pd.Series(np.nan, index=df.index)
++    market_median = df[value_col].median(skipna=True)
++    valid_cols = [c for c in group_cols if c in df.columns]
++    if not valid_cols:
++        return pd.Series(market_median, index=df.index)
++    grouped = df.groupby(valid_cols)[value_col]
++    group_median = grouped.transform("median")
++    group_size = grouped.transform("count")
++    return group_median.where(group_size >= FAIR_VALUE_MIN_PEER_GROUP, market_median)
++
++
++def estimate_fair_value(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
++    """PER/PBR/EV-EBITDA 동종그룹(섹터·시장) 중앙값 배수를 이용한 상대가치평가 기반
++    적정주가를 추정해 다음 컬럼을 추가합니다.
++      - PER_적정주가 / PBR_적정주가 / EV_EBITDA_적정주가: 방식별 추정치
++      - 적정주가: 이용 가능한 방식들의 FAIR_VALUE_WEIGHTS 가중평균
++      - 괴리율: (적정주가 - 현재주가) / 현재주가  (+면 저평가, -면 고평가 추정)
++      - 적정주가_모델수: 이번 추정에 실제로 반영된 방식 개수(신뢰도 참고용)
++    데이터가 없는 방식은 자동으로 제외되고 남은 방식들끼리 가중치를 재정규화합니다.
++    """
++    df = df.copy()
++
++    # 1) PER 기반: 동종그룹 PER 중앙값 x 자사 EPS
++    if {"PER", "EPS"}.issubset(df.columns):
++        peer_per = _peer_group_median(df, group_cols, "PER")
++        eps = df["EPS"].where(df["EPS"] > 0)
++        df["PER_적정주가"] = peer_per * eps
++    else:
++        df["PER_적정주가"] = np.nan
++
++    # 2) PBR 기반: 동종그룹 PBR 중앙값 x 자사 BPS(주당순자산)
++    if {"PBR", "BPS"}.issubset(df.columns):
++        peer_pbr = _peer_group_median(df, group_cols, "PBR")
++        bps = df["BPS"].where(df["BPS"] > 0)
++        df["PBR_적정주가"] = peer_pbr * bps
++    else:
++        df["PBR_적정주가"] = np.nan
++
++    # 3) EV/EBITDA 기반: 동종그룹 EV/EBITDA 배수 중앙값 x 자사 EBITDA -> 적정 기업가치
++    #    적정주가 = (적정 기업가치 - 순부채) / 발행주식수
++    needed = {"EBITDA", "기업가치", "순부채", "발행주식수"}
++    if needed.issubset(df.columns):
++        ebitda = df["EBITDA"].where(df["EBITDA"] > 0)
++        own_multiple = (df["기업가치"] / ebitda).where(df["기업가치"] > 0)
++        tmp = df.assign(_ev_ebitda_배수=own_multiple)
++        peer_multiple = _peer_group_median(tmp, group_cols, "_ev_ebitda_배수")
++        implied_ev = peer_multiple * ebitda
++        shares = df["발행주식수"].where(df["발행주식수"] > 0)
++        df["EV_EBITDA_적정주가"] = (implied_ev - df["순부채"]) / shares
++    else:
++        df["EV_EBITDA_적정주가"] = np.nan
++
++    # 4) 가중평균 결합 (방식별 데이터 없으면 자동 제외 후 재정규화)
++    method_cols = {"PER": "PER_적정주가", "PBR": "PBR_적정주가", "EV_EBITDA": "EV_EBITDA_적정주가"}
++    weighted_sum = pd.Series(0.0, index=df.index)
++    weight_total = pd.Series(0.0, index=df.index)
++    model_count = pd.Series(0, index=df.index)
++    for key, col in method_cols.items():
++        w = FAIR_VALUE_WEIGHTS.get(key, 0)
++        est = df[col]
++        valid = est.notna() & (est > 0) & np.isfinite(est)
++        weighted_sum[valid] += est[valid] * w
++        weight_total[valid] += w
++        model_count[valid] += 1
++
++    df["적정주가"] = weighted_sum / weight_total.replace(0, np.nan)
++    df["적정주가_모델수"] = model_count
++
++    if "현재주가" in df.columns:
++        cur = df["현재주가"].where(df["현재주가"] > 0)
++        df["괴리율"] = (df["적정주가"] - cur) / cur
++        df["괴리율"] = df["괴리율"].clip(lower=-FAIR_VALUE_MAX_UPSIDE, upper=FAIR_VALUE_MAX_UPSIDE)
++    else:
++        df["괴리율"] = np.nan
++
++    return df
++
++
+ # ==========================================================
+ # 한국 시장 데이터 수집
+ # ==========================================================
+@@ -234,6 +328,11 @@ def build_kr_universe() -> pd.DataFrame:
+     momentum = fetch_kr_momentum(df["티커"].tolist())
+     df = df.merge(momentum, on="티커", how="left")
+     df["시장구분"] = "KR"
++
++    if {"시가총액", "상장주식수"}.issubset(df.columns):
++        shares = df["상장주식수"].where(df["상장주식수"] > 0)
++        df["현재주가"] = df["시가총액"] / shares
++    df = estimate_fair_value(df, group_cols=["시장"])
+     return df
+ 
+ 
+@@ -268,6 +367,9 @@ def fetch_us_fundamentals(tickers) -> pd.DataFrame:
+         if market_cap is None or market_cap < US_MIN_MARKETCAP:
+             continue
+         fcf = info.get("freeCashflow")
++        total_debt = info.get("totalDebt")
++        total_cash = info.get("totalCash")
++        net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else np.nan
+         rows.append({
+             "티커": t, "종목명": info.get("shortName", t), "섹터": info.get("sector"),
+             "시가총액": market_cap, "PER": info.get("trailingPE"), "PBR": info.get("priceToBook"),
+@@ -275,6 +377,11 @@ def fetch_us_fundamentals(tickers) -> pd.DataFrame:
+             "매출성장률": info.get("revenueGrowth"), "이익성장률": info.get("earningsGrowth"),
+             "배당수익률": info.get("dividendYield"), "배당성향": info.get("payoutRatio"),
+             "잉여현금흐름": fcf, "FCF수익률": (fcf / market_cap) if (fcf is not None and market_cap) else np.nan,
++            # 적정주가(상대가치평가) 추정에 사용
++            "현재주가": info.get("currentPrice") or info.get("regularMarketPrice"),
++            "EPS": info.get("trailingEps"), "BPS": info.get("bookValue"),
++            "EBITDA": info.get("ebitda"), "기업가치": info.get("enterpriseValue"),
++            "순부채": net_debt, "발행주식수": info.get("sharesOutstanding"),
+         })
+         time.sleep(0.05)
+     return pd.DataFrame(rows)
+@@ -314,6 +421,7 @@ def build_us_universe() -> pd.DataFrame:
+     momentum = fetch_us_momentum(fundamentals["티커"].tolist())
+     df = fundamentals.merge(momentum, on="티커", how="left")
+     df["시장구분"] = "US"
++    df = estimate_fair_value(df, group_cols=["섹터"])
+     return df
+ 
+ 
+@@ -329,6 +437,7 @@ def export(df: pd.DataFrame) -> str:
+         "전체순위", "시장구분", "티커", "종목명", "섹터", "시가총액",
+         "PER", "PBR", "ROE", "부채비율", "배당수익률", "FCF수익률",
+         "수익률_3M", "수익률_6M", "수익률_12M", "매출성장률", "이익성장률",
++        "현재주가", "적정주가", "괴리율", "적정주가_모델수",
+         "가치점수", "모멘텀점수", "배당점수", "종합점수",
+     ] if c in df.columns]
+ 
+@@ -337,13 +446,25 @@ def export(df: pd.DataFrame) -> str:
+         df.sort_values("가치점수", ascending=False)[display_cols].head(TOP_N).to_excel(writer, sheet_name="가치주TOP", index=False)
+         df.sort_values("모멘텀점수", ascending=False)[display_cols].head(TOP_N).to_excel(writer, sheet_name="성장모멘텀TOP", index=False)
+         df.sort_values("배당점수", ascending=False)[display_cols].head(TOP_N).to_excel(writer, sheet_name="배당TOP", index=False)
++        if "괴리율" in df.columns:
++            fv = df[df["적정주가_모델수"] >= 2] if "적정주가_모델수" in df.columns else df
++            fv.sort_values("괴리율", ascending=False)[display_cols].head(TOP_N).to_excel(
++                writer, sheet_name="적정주가_저평가TOP", index=False)
+         if (df["시장구분"] == "KR").any():
+             df[df["시장구분"] == "KR"][display_cols].to_excel(writer, sheet_name="KR_전체", index=False)
+         if (df["시장구분"] == "US").any():
+             df[df["시장구분"] == "US"][display_cols].to_excel(writer, sheet_name="US_전체", index=False)
+         meta = pd.DataFrame({
+-            "항목": ["실행일시", "가치 가중치", "모멘텀 가중치", "배당 가중치", "PER 상한", "PBR 상한"],
+-            "값": [ts, WEIGHTS["value"], WEIGHTS["momentum"], WEIGHTS["dividend"], PER_MAX, PBR_MAX],
++            "항목": [
++                "실행일시", "가치 가중치", "모멘텀 가중치", "배당 가중치", "PER 상한", "PBR 상한",
++                "적정주가-PER 가중치", "적정주가-PBR 가중치", "적정주가-EV/EBITDA 가중치",
++                "적정주가 최소 동종그룹 표본수",
++            ],
++            "값": [
++                ts, WEIGHTS["value"], WEIGHTS["momentum"], WEIGHTS["dividend"], PER_MAX, PBR_MAX,
++                FAIR_VALUE_WEIGHTS["PER"], FAIR_VALUE_WEIGHTS["PBR"], FAIR_VALUE_WEIGHTS["EV_EBITDA"],
++                FAIR_VALUE_MIN_PEER_GROUP,
++            ],
+         })
+         meta.to_excel(writer, sheet_name="실행설정", index=False)
+ 
+@@ -366,24 +487,35 @@ def _fmt_pct(v, digits=1):
+     return f"{v*100:+.{digits}f}%"
+ 
+ 
+-def _card(row) -> str:
++def _card(row, show_fair_value=False) -> str:
+     name = html.escape(str(row.get("종목명", "")))
+     ticker = html.escape(str(row.get("티커", "")))
+     flag = "\U0001F1F0\U0001F1F7" if row.get("시장구분") == "KR" else "\U0001F1FA\U0001F1F8"
+     per, pbr, div = _fmt(row.get("PER")), _fmt(row.get("PBR")), _fmt(row.get("배당수익률"))
+     m12, score = _fmt_pct(row.get("수익률_12M")), _fmt(row.get("종합점수"))
++    extra_metrics = f'<span>PER {per}</span><span>PBR {pbr}</span><span>배당 {div}%</span><span>12개월 {m12}</span>'
++    if show_fair_value:
++        fv, gap = _fmt(row.get("적정주가"), 0), _fmt_pct(row.get("괴리율"))
++        n = row.get("적정주가_모델수")
++        n_str = f"{int(n)}개 모델" if pd.notna(n) else "-"
++        extra_metrics = f'<span>적정주가 {fv}</span><span>괴리율 {gap}</span><span>{n_str}</span>'
+     return (f'<div class="card"><div class="card-top"><span class="flag">{flag}</span>'
+             f'<span class="name">{name}</span><span class="ticker">{ticker}</span>'
+             f'<span class="score">{score}</span></div><div class="metrics">'
+-            f'<span>PER {per}</span><span>PBR {pbr}</span><span>배당 {div}%</span>'
+-            f'<span>12개월 {m12}</span></div></div>')
++            f'{extra_metrics}</div></div>')
+ 
+ 
+-def _section(anchor, title, df, sort_col, n) -> str:
+-    if sort_col not in df.columns or df.empty:
++def _section(anchor, title, df, sort_col, n, show_fair_value=False, min_models=0) -> str:
++    base = df
++    if min_models and "적정주가_모델수" in df.columns:
++        base = df[df["적정주가_모델수"] >= min_models]
++    if sort_col not in base.columns or base.empty:
+         rows_html = '<p class="empty">데이터 없음</p>'
+     else:
+-        rows_html = "".join(_card(r) for _, r in df.sort_values(sort_col, ascending=False).head(n).iterrows())
++        rows_html = "".join(
++            _card(r, show_fair_value=show_fair_value)
++            for _, r in base.sort_values(sort_col, ascending=False).head(n).iterrows()
++        )
+     return f'<section id="{anchor}"><h2>{html.escape(title)}</h2><div class="cards">{rows_html}</div></section>'
+ 
+ 
+@@ -394,6 +526,8 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
+     value = _section("value", "\U0001F4B0 가치주 TOP 15", df, "가치점수", 15)
+     mom = _section("momentum", "\U0001F680 성장·모멘텀 TOP 15", df, "모멘텀점수", 15)
+     div_ = _section("dividend", "\U0001F4B5 배당·현금흐름 TOP 15", df, "배당점수", 15)
++    fair = _section("fairvalue", "\U0001F3AF 적정주가 저평가 TOP 15", df, "괴리율", 15,
++                     show_fair_value=True, min_models=2)
+ 
+     doc = f"""<!doctype html>
+ <html lang="ko">
+@@ -434,10 +568,14 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
+   <p>업데이트: {ts} (KST) · 가치 {w['value']*100:.0f}% · 모멘텀 {w['momentum']*100:.0f}% · 배당 {w['dividend']*100:.0f}%<br>
+   <a class="dl" href="reports/latest.xlsx">엑셀 전체 데이터 다운로드</a></p>
+ </header>
+-<nav><a href="#top">종합</a><a href="#value">가치주</a><a href="#momentum">모멘텀</a><a href="#dividend">배당</a></nav>
+-<main>{total}{value}{mom}{div_}</main>
++<nav><a href="#top">종합</a><a href="#value">가치주</a><a href="#momentum">모멘텀</a><a href="#dividend">배당</a><a href="#fairvalue">적정주가</a></nav>
++<main>{total}{value}{mom}{div_}{fair}</main>
+ <footer>본 리포트는 투자자문이 아닙니다. 공개 데이터를 기계적으로 점수화한 참고 자료이며,<br>
+-투자 판단과 책임은 본인에게 있습니다. 매일 자동 갱신됩니다 (GitHub Actions).</footer>
++투자 판단과 책임은 본인에게 있습니다. 매일 자동 갱신됩니다 (GitHub Actions).<br><br>
++"적정주가"는 동종 섹터/시장의 PER·PBR·EV-EBITDA 중앙값 배수를 자사 실적에 대입한
++<b>상대가치평가</b> 추정치입니다(미래 현금흐름을 직접 추정하는 DCF가 아님). 동종군 표본이 적거나
++실적이 일시적으로 왜곡된 경우 오차가 커질 수 있어, 사용된 모델 수가 2개 이상인 종목 위주로
++참고하시고 최종 투자 판단 전 재무제표 원본을 확인하세요.</footer>
+ </body>
+ </html>"""
+ 
