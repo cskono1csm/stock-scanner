@@ -82,6 +82,7 @@ US_MIN_MARKETCAP = 2_000_000_000       # 20억달러
 PER_MAX = 60
 PBR_MAX = 15
 EXCLUDE_NEGATIVE_EARNINGS = True
+DIVIDEND_YIELD_MAX = 20        # 배당수익률 상한(%) — 이보다 크면 데이터 이상치로 보고 제외
 
 # 적정주가(상대가치평가) 추정 설정
 # - PER/PBR/EV-EBITDA 각 방식으로 "동종그룹(섹터 또는 시장) 중앙값 배수"를 적용해
@@ -138,6 +139,7 @@ def _normalize_pct(series: pd.Series) -> pd.Series:
     s = series.copy()
     mask = s.notna() & (s.abs() < 1)
     s[mask] = s[mask] * 100
+    s[s.notna() & ((s < 0) | (s > DIVIDEND_YIELD_MAX))] = np.nan
     return s
 
 
@@ -522,6 +524,7 @@ def build_us_universe() -> pd.DataFrame:
         fundamentals.loc[fundamentals["PER"] <= 0, "PER"] = np.nan
     fundamentals.loc[fundamentals["PER"] > PER_MAX, "PER"] = np.nan
     fundamentals.loc[fundamentals["PBR"] > PBR_MAX, "PBR"] = np.nan
+    fundamentals.loc[fundamentals["PBR"] <= 0, "PBR"] = np.nan
     momentum = fetch_us_momentum(fundamentals["티커"].tolist())
     df = fundamentals.merge(momentum, on="티커", how="left")
     df["시장구분"] = "US"
