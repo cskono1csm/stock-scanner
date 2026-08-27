@@ -440,7 +440,12 @@ def build_kr_universe() -> pd.DataFrame:
 # ==========================================================
 def get_sp500_tickers() -> list:
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    resp = requests.get(url, headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }, timeout=30)
+    resp.raise_for_status()
+    tables = pd.read_html(resp.text)
     df = tables[0]
     return df["Symbol"].str.replace(".", "-", regex=False).tolist()
 
