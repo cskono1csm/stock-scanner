@@ -46,8 +46,14 @@ def _patched_request(self, method, url, **kwargs):
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     )
+    headers.setdefault("Referer", "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/index.cmd")
     kwargs["headers"] = headers
-    return _orig_request(self, method, url, **kwargs)
+    resp = _orig_request(self, method, url, **kwargs)
+    if "data.krx.co.kr" in url:
+        print(f"[DEBUG-KRX] {method} {url}")
+        print(f"[DEBUG-KRX] status={resp.status_code} content-type={resp.headers.get('Content-Type')} len={len(resp.content)}")
+        print(f"[DEBUG-KRX] body_head={resp.text[:300]!r}")
+    return resp
 requests.sessions.Session.request = _patched_request
 
 
