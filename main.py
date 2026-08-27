@@ -230,7 +230,7 @@ def estimate_fair_value(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
     model_count = pd.Series(0, index=df.index)
     for key, col in method_cols.items():
         w = FAIR_VALUE_WEIGHTS.get(key, 0)
-        est = df[col]
+        est = pd.to_numeric(df[col], errors="coerce")
         valid = est.notna() & (est > 0) & np.isfinite(est)
         weighted_sum[valid] += est[valid] * w
         weight_total[valid] += w
