@@ -38,6 +38,7 @@ except ImportError:
     yf = None
     
 import requests
+from bs4 import BeautifulSoup
 
 _orig_request = requests.sessions.Session.request
 def _patched_request(self, method, url, **kwargs):
@@ -344,7 +345,48 @@ def get_kr_ticker_universe() -> pd.DataFrame:
         print(f"[KR] 종목 리스트 {before}개 -> 시가총액 사전 필터 후 {len(combined)}개")
     return combined.reset_index(drop=True)
 
+_naver_debug_done = False
 
+
+def _fetch_naver_valuation(code: str) -> dict:
+    """yfinance가 한국 종목에는 PER/PBR/EPS/BPS를 거의 채워주지 못해(Yahoo의 KRX 커버리지 한계),
+    네이버금융 종목 페이지에서 이 4개 값만 보강 수집합니다."""
+    global _naver_debug_done
+    result = {"PER": np.nan, "PBR": np.nan, "EPS": np.nan, "BPS": np.nan}
+    try:
+        resp = requests.get(
+            f"https://finance.naver.com/item/main.naver?code={code}",
+            headers={"Referer": "https://finance.naver.com/"},
+            timeout=10,
+        )
+        soup = BeautifulSoup(resp.content, "html.parser")
+
+        def _num(elem_id):
+            el = soup.find("em", id=elem_id)
+            if not el:
+                return np.nan
+            txt = el.get_text(strip=True).replace(",", "")
+            try:
+                return float(txt)
+            except ValueError:
+                return np.nan
+
+        result["PER"] = _num("_per")
+        result["PBR"] = _num("_pbr")
+        result["EPS"] = _num("_eps")
+        result["BPS"] = _num("_bps")
+
+        if not _naver_debug_done:
+            _naver_debug_done = True
+            print(f"[DEBUG-NAVER] {code} status={resp.status_code} 결과={result}")
+            if pd.isna(result["PER"]):
+                print(f"[DEBUG-NAVER] _per 태그를 못 찾음. 페이지 앞부분={resp.text[:800]!r}")
+    except Exception as e:
+        if not _naver_debug_done:
+            _naver_debug_done = True
+            print(f"[DEBUG-NAVER] {code} 요청 실패: {e}")
+    return result
+    
 def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
     """yfinance로 .KS(코스피)/.KQ(코스닥) 접미사를 붙여 한국 종목 펀더멘털을 수집합니다.
     미국 종목 수집(fetch_us_fundamentals)과 동일한 경로/필드를 사용합니다."""
@@ -365,17 +407,23 @@ def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
             continue
         if not info:
             continue
-        market_cap = info.get("marketCap")
+               market_cap = info.get("marketCap")
         shares = info.get("sharesOutstanding")
         fcf = info.get("freeCashflow")
         total_debt = info.get("totalDebt")
         total_cash = info.get("totalCash")
         net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else np.nan
+        naver_val = _fetch_naver_valuation(code)
+        per = naver_val["PER"] if pd.notna(naver_val["PER"]) else info.get("trailingPE")
+        pbr = naver_val["PBR"] if pd.notna(naver_val["PBR"]) else info.get("priceToBook")
+        eps = naver_val["EPS"] if pd.notna(naver_val["EPS"]) else info.get("trailingEps")
+        bps = naver_val["BPS"] if pd.notna(naver_val["BPS"]) else info.get("bookValue")
+        time.sleep(0.05)
         rows.append({
             "티커": code, "종목명": name, "시장": market, "섹터": info.get("sector"),
             "시가총액": market_cap, "상장주식수": shares, "발행주식수": shares,
-            "PER": info.get("trailingPE"), "PBR": info.get("priceToBook"),
-            "EPS": info.get("trailingEps"), "BPS": info.get("bookValue"),
+            "PER": per, "PBR": pbr,
+            "EPS": eps, "BPS": bps,
             "DIV": info.get("dividendYield"), "배당성향": info.get("payoutRatio"),
             "부채비율": info.get("debtToEquity"), "ROE": info.get("returnOnEquity"),
             "매출성장률": info.get("revenueGrowth"), "이익성장률": info.get("earningsGrowth"),
