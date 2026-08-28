@@ -12,6 +12,7 @@ config/scoring/kr/us/dashboard 로직을 하나의 파일로 합쳤습니다.
 ==========================================================
 """
 import argparse
+import concurrent.futures
 import datetime as dt
 import html
 import json
@@ -391,6 +392,24 @@ def _fetch_naver_valuation(code: str) -> dict:
     return result
 
 
+def _fetch_naver_valuations_parallel(codes, max_workers=10) -> dict:
+    """여러 종목의 네이버금융 PER/PBR/EPS/BPS를 동시에(병렬) 수집합니다.
+    종목당 순차 요청은 1,300여 개 종목 기준으로 수십 분이 추가로 걸려
+    GitHub Actions의 job timeout(45분)을 넘겨 실행이 취소되는 문제가 있었습니다.
+    스레드풀로 동시에 요청해 전체 소요 시간을 크게 줄입니다."""
+    results = {}
+    codes = list(dict.fromkeys(str(c) for c in codes))  # 중복 제거, 순서 보존
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(_fetch_naver_valuation, code): code for code in codes}
+        for future in concurrent.futures.as_completed(future_map):
+            code = future_map[future]
+            try:
+                results[code] = future.result()
+            except Exception:
+                results[code] = {"PER": np.nan, "PBR": np.nan, "EPS": np.nan, "BPS": np.nan}
+    return results
+
+
 def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
     """yfinance로 .KS(코스피)/.KQ(코스닥) 접미사를 붙여 한국 종목 펀더멘털을 수집합니다.
     미국 종목 수집(fetch_us_fundamentals)과 동일한 경로/필드를 사용합니다."""
@@ -401,6 +420,14 @@ def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
     universe = universe[universe["시장"].isin(markets)]
     suffix = {"KOSPI": ".KS", "KOSDAQ": ".KQ"}
 
+    # yfinance는 한국 종목에는 PER/PBR/EPS/BPS를 거의 채워주지 못해(Yahoo의 KRX 커버리지 한계),
+    # 네이버금융에서 이 4개 값만 보강 수집합니다. 종목 수가 많아(1,000개 이상) 순차 요청 시
+    # 실행 시간이 크게 늘어나므로, 아래에서 한 번에 병렬로 미리 수집해둡니다.
+    print(f"[KR] 네이버금융 PER/PBR/EPS/BPS 병렬 수집 시작 ({len(universe)}개 종목)")
+    naver_map = _fetch_naver_valuations_parallel(universe["티커"].tolist())
+    print(f"[KR] 네이버금융 수집 완료 ({len(naver_map)}개)")
+
+    empty_naver = {"PER": np.nan, "PBR": np.nan, "EPS": np.nan, "BPS": np.nan}
     rows = []
     for _, r in universe.iterrows():
         code, name, market = str(r["티커"]), r["종목명"], r["시장"]
@@ -417,9 +444,7 @@ def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
         total_debt = info.get("totalDebt")
         total_cash = info.get("totalCash")
         net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else np.nan
-        # yfinance는 한국 종목에는 PER/PBR/EPS/BPS를 거의 채워주지 못해(Yahoo의 KRX 커버리지 한계),
-        # 네이버금융에서 이 4개 값만 보강 수집하고, 실패 시에만 yfinance 값으로 대체합니다.
-        naver_val = _fetch_naver_valuation(code)
+        naver_val = naver_map.get(code, empty_naver)
         per = naver_val["PER"] if pd.notna(naver_val["PER"]) else info.get("trailingPE")
         pbr = naver_val["PBR"] if pd.notna(naver_val["PBR"]) else info.get("priceToBook")
         eps = naver_val["EPS"] if pd.notna(naver_val["EPS"]) else info.get("trailingEps")
