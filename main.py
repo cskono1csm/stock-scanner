@@ -14,6 +14,7 @@ config/scoring/kr/us/dashboard 로직을 하나의 파일로 합쳤습니다.
 import argparse
 import datetime as dt
 import html
+import json
 import os
 import shutil
 import time
@@ -365,12 +366,22 @@ def fetch_kr_fundamentals_yfinance(markets=None) -> pd.DataFrame:
         if not info:
             continue
         market_cap = info.get("marketCap")
+        shares = info.get("sharesOutstanding")
+        fcf = info.get("freeCashflow")
+        total_debt = info.get("totalDebt")
+        total_cash = info.get("totalCash")
+        net_debt = (total_debt - total_cash) if (total_debt is not None and total_cash is not None) else np.nan
         rows.append({
-            "티커": code, "종목명": name, "시장": market,
-            "시가총액": market_cap, "상장주식수": info.get("sharesOutstanding"),
+            "티커": code, "종목명": name, "시장": market, "섹터": info.get("sector"),
+            "시가총액": market_cap, "상장주식수": shares, "발행주식수": shares,
             "PER": info.get("trailingPE"), "PBR": info.get("priceToBook"),
             "EPS": info.get("trailingEps"), "BPS": info.get("bookValue"),
-            "DIV": info.get("dividendYield"),
+            "DIV": info.get("dividendYield"), "배당성향": info.get("payoutRatio"),
+            "부채비율": info.get("debtToEquity"), "ROE": info.get("returnOnEquity"),
+            "매출성장률": info.get("revenueGrowth"), "이익성장률": info.get("earningsGrowth"),
+            "잉여현금흐름": fcf, "FCF수익률": (fcf / market_cap) if (fcf is not None and market_cap) else np.nan,
+            "EBITDA": info.get("ebitda"), "기업가치": info.get("enterpriseValue"),
+            "순부채": net_debt,
             "현재주가": info.get("currentPrice") or info.get("regularMarketPrice"),
         })
         time.sleep(0.05)
@@ -594,10 +605,38 @@ def _fmt_pct(v, digits=1):
     return f"{v*100:+.{digits}f}%"
 
 
+def _fmt_money(v, market, is_price=False) -> str:
+    """시가총액/현금흐름/적정주가 등 금액을 시장에 맞는 단위(원/달러)로 보기 좋게 표시합니다."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return "-"
+    if market == "KR":
+        if is_price:
+            return f"{v:,.0f}원"
+        eok = v / 1e8
+        if abs(eok) >= 10000:
+            return f"{eok/10000:,.1f}조원"
+        return f"{eok:,.0f}억원"
+    if is_price:
+        return f"${v:,.2f}"
+    if abs(v) >= 1e9:
+        return f"${v/1e9:,.1f}B"
+    return f"${v/1e6:,.0f}M"
+
+
+def _card_key(row) -> str:
+    return f"{row.get('시장구분', 'US')}_{row.get('티커', '')}"
+
+
 def _card(row, show_fair_value=False) -> str:
     name = html.escape(str(row.get("종목명", "")))
     ticker = html.escape(str(row.get("티커", "")))
-    flag = "\U0001F1F0\U0001F1F7" if row.get("시장구분") == "KR" else "\U0001F1FA\U0001F1F8"
+    market = row.get("시장구분", "US")
+    flag = "\U0001F1F0\U0001F1F7" if market == "KR" else "\U0001F1FA\U0001F1F8"
+    key = html.escape(_card_key(row))
     per, pbr, div = _fmt(row.get("PER")), _fmt(row.get("PBR")), _fmt(row.get("배당수익률"))
     m12, score = _fmt_pct(row.get("수익률_12M")), _fmt(row.get("종합점수"))
     extra_metrics = f'<span>PER {per}</span><span>PBR {pbr}</span><span>배당 {div}%</span><span>12개월 {m12}</span>'
@@ -606,7 +645,8 @@ def _card(row, show_fair_value=False) -> str:
         n = row.get("적정주가_모델수")
         n_str = f"{int(n)}개 모델" if pd.notna(n) else "-"
         extra_metrics = f'<span>적정주가 {fv}</span><span>괴리율 {gap}</span><span>{n_str}</span>'
-    return (f'<div class="card"><div class="card-top"><span class="flag">{flag}</span>'
+    return (f'<div class="card" data-market="{market}" data-key="{key}">'
+            f'<div class="card-top"><span class="flag">{flag}</span>'
             f'<span class="name">{name}</span><span class="ticker">{ticker}</span>'
             f'<span class="score">{score}</span></div><div class="metrics">'
             f'{extra_metrics}</div></div>')
@@ -616,14 +656,123 @@ def _section(anchor, title, df, sort_col, n, show_fair_value=False, min_models=0
     base = df
     if min_models and "적정주가_모델수" in df.columns:
         base = df[df["적정주가_모델수"] >= min_models]
-    if sort_col not in base.columns or base.empty:
-        rows_html = '<p class="empty">데이터 없음</p>'
-    else:
-        rows_html = "".join(
-            _card(r, show_fair_value=show_fair_value)
-            for _, r in base.sort_values(sort_col, ascending=False).head(n).iterrows()
+    if sort_col not in base.columns:
+        base = base.iloc[0:0]
+
+    groups = []
+    for market, label in (("KR", "\U0001F1F0\U0001F1F7 한국"), ("US", "\U0001F1FA\U0001F1F8 미국")):
+        sub = base[base["시장구분"] == market] if "시장구분" in base.columns else base.iloc[0:0]
+        if sub.empty:
+            cards_html = '<p class="empty">데이터 없음</p>'
+        else:
+            cards_html = "".join(
+                _card(r, show_fair_value=show_fair_value)
+                for _, r in sub.sort_values(sort_col, ascending=False).head(n).iterrows()
+            )
+        groups.append(
+            f'<div class="market-group" data-market="{market}">'
+            f'<h3 class="market-h">{label}</h3><div class="cards">{cards_html}</div></div>'
         )
-    return f'<section id="{anchor}"><h2>{html.escape(title)}</h2><div class="cards">{rows_html}</div></section>'
+    return f'<section id="{anchor}"><h2>{html.escape(title)}</h2>{"".join(groups)}</section>'
+
+
+def _detail_row(label, value) -> str:
+    return f'<div class="drow"><span class="dlabel">{html.escape(label)}</span><span class="dvalue">{value}</span></div>'
+
+
+def _detail_group(title, rows_html) -> str:
+    return f'<div class="dgroup"><h4>{html.escape(title)}</h4>{rows_html}</div>'
+
+
+def _detail_payload(row) -> dict:
+    """카드를 클릭했을 때 보여줄 종목 세부정보(회계/재무 지표) HTML 조각을 만듭니다."""
+    market = row.get("시장구분", "US")
+    ticker = str(row.get("티커", ""))
+    name = html.escape(str(row.get("종목명", "")))
+    sector_val = row.get("섹터")
+    sector = html.escape(str(sector_val)) if pd.notna(sector_val) else "-"
+
+    basic = "".join([
+        _detail_row("시장", "코스피/코스닥" if market == "KR" else "S&amp;P500(미국)"),
+        _detail_row("섹터", sector),
+        _detail_row("시가총액", _fmt_money(row.get("시가총액"), market)),
+        _detail_row("현재주가", _fmt_money(row.get("현재주가"), market, is_price=True)),
+    ])
+    valuation = "".join([
+        _detail_row("PER", _fmt(row.get("PER"))),
+        _detail_row("PBR", _fmt(row.get("PBR"))),
+        _detail_row("EPS(주당순이익)", _fmt(row.get("EPS"))),
+        _detail_row("BPS(주당순자산)", _fmt(row.get("BPS"))),
+    ])
+    health = "".join([
+        _detail_row("ROE", _fmt_pct(row.get("ROE"))),
+        _detail_row("부채비율", _fmt(row.get("부채비율"))),
+    ])
+    growth = "".join([
+        _detail_row("매출성장률", _fmt_pct(row.get("매출성장률"))),
+        _detail_row("이익성장률", _fmt_pct(row.get("이익성장률"))),
+    ])
+    div_html = "".join([
+        _detail_row("배당수익률", f"{_fmt(row.get('배당수익률'))}%"),
+        _detail_row("배당성향", _fmt_pct(row.get("배당성향"))),
+        _detail_row("FCF수익률", _fmt_pct(row.get("FCF수익률"))),
+        _detail_row("잉여현금흐름", _fmt_money(row.get("잉여현금흐름"), market)),
+    ])
+    momentum = "".join([
+        _detail_row("3개월 수익률", _fmt_pct(row.get("수익률_3M"))),
+        _detail_row("6개월 수익률", _fmt_pct(row.get("수익률_6M"))),
+        _detail_row("12개월 수익률", _fmt_pct(row.get("수익률_12M"))),
+    ])
+    fair = "".join([
+        _detail_row("PER 모델 적정주가", _fmt_money(row.get("PER_적정주가"), market, is_price=True)),
+        _detail_row("PBR 모델 적정주가", _fmt_money(row.get("PBR_적정주가"), market, is_price=True)),
+        _detail_row("EV/EBITDA 모델 적정주가", _fmt_money(row.get("EV_EBITDA_적정주가"), market, is_price=True)),
+        _detail_row("종합 적정주가", _fmt_money(row.get("적정주가"), market, is_price=True)),
+        _detail_row("괴리율", _fmt_pct(row.get("괴리율"))),
+    ])
+    scores = "".join([
+        _detail_row("가치점수", _fmt(row.get("가치점수"))),
+        _detail_row("모멘텀점수", _fmt(row.get("모멘텀점수"))),
+        _detail_row("배당점수", _fmt(row.get("배당점수"))),
+        _detail_row("종합점수", _fmt(row.get("종합점수"))),
+    ])
+
+    body = "".join([
+        _detail_group("기본정보", basic),
+        _detail_group("밸류에이션", valuation),
+        _detail_group("수익성·재무건전성", health),
+        _detail_group("성장성", growth),
+        _detail_group("배당·현금흐름", div_html),
+        _detail_group("가격 모멘텀", momentum),
+        _detail_group("적정주가(상대가치평가)", fair),
+        _detail_group("스코어", scores),
+    ])
+
+    if market == "KR":
+        ext_url = f"https://finance.naver.com/item/main.naver?code={ticker}"
+        ext_label = "네이버 금융에서 재무제표 전체 보기 →"
+    else:
+        ext_url = f"https://finance.yahoo.com/quote/{ticker}/financials"
+        ext_label = "Yahoo Finance에서 재무제표 전체 보기 →"
+    link = f'<a class="ext-link" href="{html.escape(ext_url)}" target="_blank" rel="noopener">{html.escape(ext_label)}</a>'
+
+    flag = "\U0001F1F0\U0001F1F7" if market == "KR" else "\U0001F1FA\U0001F1F8"
+    rank = row.get("전체순위")
+    rank_str = f" · 종합순위 {int(rank)}위" if pd.notna(rank) else ""
+    return {
+        "title": f"{flag} {name}",
+        "sub": f"{ticker}{rank_str}",
+        "body": body,
+        "link": link,
+    }
+
+
+def _build_details_json(df: pd.DataFrame) -> str:
+    details = {}
+    dedup = df.drop_duplicates(subset=["시장구분", "티커"])
+    for _, r in dedup.iterrows():
+        details[_card_key(r)] = _detail_payload(r)
+    return json.dumps(details, ensure_ascii=False)
 
 
 def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
@@ -635,6 +784,7 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
     div_ = _section("dividend", "\U0001F4B5 배당·현금흐름 TOP 15", df, "배당점수", 15)
     fair = _section("fairvalue", "\U0001F3AF 적정주가 저평가 TOP 15", df, "괴리율", 15,
                      show_fair_value=True, min_models=2)
+    details_json = _build_details_json(df)
 
     doc = f"""<!doctype html>
 <html lang="ko">
@@ -651,13 +801,21 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
   header {{ padding:18px 16px 10px; position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--border); z-index:10; }}
   header h1 {{ margin:0 0 4px; font-size:19px; }}
   header p {{ margin:0; color:var(--muted); font-size:12.5px; line-height:1.5; }}
-  nav {{ display:flex; gap:8px; overflow-x:auto; padding:10px 16px; -webkit-overflow-scrolling:touch; }}
+  nav {{ display:flex; gap:8px; overflow-x:auto; padding:10px 16px 0; -webkit-overflow-scrolling:touch; }}
   nav a {{ flex:0 0 auto; padding:7px 14px; background:var(--card); border:1px solid var(--border); border-radius:999px; color:var(--text); text-decoration:none; font-size:13px; }}
+  .filterbar {{ display:flex; gap:8px; padding:10px 16px; -webkit-overflow-scrolling:touch; }}
+  .filter-btn {{ flex:1; padding:8px 10px; background:var(--card); border:1px solid var(--border); border-radius:10px; color:var(--muted); font-size:13px; font-weight:600; }}
+  .filter-btn.active {{ background:var(--accent); border-color:var(--accent); color:#fff; }}
   main {{ padding:0 16px 30px; max-width:640px; margin:0 auto; }}
-  section {{ margin-top:22px; scroll-margin-top:110px; }}
+  section {{ margin-top:22px; scroll-margin-top:150px; }}
   section h2 {{ font-size:15.5px; margin:0 0 10px; }}
+  .market-h {{ font-size:12.5px; color:var(--muted); margin:14px 0 8px; font-weight:600; }}
+  .market-group:first-child .market-h {{ margin-top:0; }}
+  body.filter-KR .market-group[data-market="US"] {{ display:none; }}
+  body.filter-US .market-group[data-market="KR"] {{ display:none; }}
   .cards {{ display:flex; flex-direction:column; gap:8px; }}
-  .card {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:12px 14px; }}
+  .card {{ background:var(--card); border:1px solid var(--border); border-radius:12px; padding:12px 14px; cursor:pointer; }}
+  .card:active {{ opacity:.7; }}
   .card-top {{ display:flex; align-items:center; gap:6px; }}
   .flag {{ font-size:15px; }}
   .name {{ font-weight:600; font-size:14px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
@@ -667,6 +825,24 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
   .empty {{ color:var(--muted); font-size:13px; }}
   footer {{ text-align:center; color:var(--muted); font-size:11px; padding:14px 16px 36px; line-height:1.7; }}
   a.dl {{ color:var(--accent); }}
+  .overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:100;
+    align-items:flex-end; justify-content:center; }}
+  .overlay.open {{ display:flex; }}
+  .sheet {{ background:var(--card); width:100%; max-width:640px; max-height:82vh; overflow-y:auto;
+    border-radius:16px 16px 0 0; border:1px solid var(--border); border-bottom:none; padding:16px 16px 24px; }}
+  .sheet-header {{ display:flex; align-items:flex-start; justify-content:space-between; gap:10px;
+    position:sticky; top:-16px; background:var(--card); padding:0 0 10px; margin:-16px 0 4px; }}
+  .sheet-title {{ font-size:16.5px; font-weight:700; }}
+  .sheet-sub {{ font-size:12px; color:var(--muted); margin-top:2px; }}
+  .close-btn {{ background:none; border:none; color:var(--muted); font-size:18px; padding:4px 8px; cursor:pointer; }}
+  .dgroup {{ margin-top:14px; }}
+  .dgroup h4 {{ font-size:12.5px; color:var(--accent); margin:0 0 6px; }}
+  .drow {{ display:flex; justify-content:space-between; padding:5px 0; border-bottom:1px solid var(--border); font-size:13px; }}
+  .drow:last-child {{ border-bottom:none; }}
+  .dlabel {{ color:var(--muted); }}
+  .dvalue {{ font-weight:600; text-align:right; }}
+  .ext-link {{ display:block; text-align:center; margin-top:18px; padding:11px; background:var(--accent);
+    color:#fff; text-decoration:none; border-radius:10px; font-size:13.5px; font-weight:600; }}
 </style>
 </head>
 <body>
@@ -676,13 +852,62 @@ def build_dashboard(df: pd.DataFrame, out_path: str = "docs/index.html") -> str:
   <a class="dl" href="reports/latest.xlsx">엑셀 전체 데이터 다운로드</a></p>
 </header>
 <nav><a href="#top">종합</a><a href="#value">가치주</a><a href="#momentum">모멘텀</a><a href="#dividend">배당</a><a href="#fairvalue">적정주가</a></nav>
+<div class="filterbar">
+  <button class="filter-btn active" data-filter="all">전체</button>
+  <button class="filter-btn" data-filter="KR">\U0001F1F0\U0001F1F7 한국만</button>
+  <button class="filter-btn" data-filter="US">\U0001F1FA\U0001F1F8 미국만</button>
+</div>
 <main>{total}{value}{mom}{div_}{fair}</main>
 <footer>본 리포트는 투자자문이 아닙니다. 공개 데이터를 기계적으로 점수화한 참고 자료이며,<br>
 투자 판단과 책임은 본인에게 있습니다. 매일 자동 갱신됩니다 (GitHub Actions).<br><br>
 "적정주가"는 동종 섹터/시장의 PER·PBR·EV-EBITDA 중앙값 배수를 자사 실적에 대입한
 <b>상대가치평가</b> 추정치입니다(미래 현금흐름을 직접 추정하는 DCF가 아님). 동종군 표본이 적거나
 실적이 일시적으로 왜곡된 경우 오차가 커질 수 있어, 사용된 모델 수가 2개 이상인 종목 위주로
-참고하시고 최종 투자 판단 전 재무제표 원본을 확인하세요.</footer>
+참고하시고 최종 투자 판단 전 재무제표 원본을 확인하세요.<br><br>
+카드를 탭하면 회계·재무 세부정보를 볼 수 있습니다.</footer>
+
+<div class="overlay" id="detailOverlay">
+  <div class="sheet">
+    <div class="sheet-header">
+      <div>
+        <div class="sheet-title" id="dTitle"></div>
+        <div class="sheet-sub" id="dSub"></div>
+      </div>
+      <button class="close-btn" id="dClose">✕</button>
+    </div>
+    <div id="dBody"></div>
+    <div id="dLink"></div>
+  </div>
+</div>
+
+<script>
+const DETAILS = {details_json};
+const overlay = document.getElementById('detailOverlay');
+function openDetail(key) {{
+  const d = DETAILS[key];
+  if (!d) return;
+  document.getElementById('dTitle').innerHTML = d.title;
+  document.getElementById('dSub').innerHTML = d.sub;
+  document.getElementById('dBody').innerHTML = d.body;
+  document.getElementById('dLink').innerHTML = d.link;
+  overlay.classList.add('open');
+}}
+function closeDetail() {{ overlay.classList.remove('open'); }}
+document.getElementById('dClose').addEventListener('click', closeDetail);
+overlay.addEventListener('click', function(e) {{ if (e.target === overlay) closeDetail(); }});
+document.querySelector('main').addEventListener('click', function(e) {{
+  const card = e.target.closest('.card');
+  if (card && card.dataset.key) openDetail(card.dataset.key);
+}});
+document.querySelectorAll('.filter-btn').forEach(function(btn) {{
+  btn.addEventListener('click', function() {{
+    document.querySelectorAll('.filter-btn').forEach(function(b) {{ b.classList.remove('active'); }});
+    btn.classList.add('active');
+    const f = btn.dataset.filter;
+    document.body.className = (f === 'all') ? '' : 'filter-' + f;
+  }});
+}});
+</script>
 </body>
 </html>"""
 
