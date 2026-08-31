@@ -27,10 +27,16 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run screener (KR + US)
         run: python main.py
-      - name: Commit updated dashboard
+           - name: Commit updated dashboard
         run: |
           git config user.name "stock-screener-bot"
           git config user.email "actions@users.noreply.github.com"
           git add docs
           git diff --cached --quiet || git commit -m "자동 갱신: $(date -u +'%Y-%m-%d %H:%M UTC')"
-          git push
+          for i in 1 2 3; do
+            git push && break
+            echo "푸시 충돌 감지, 최신 내용을 받아 재시도합니다 (시도 $i/3)"
+            git fetch origin main
+            git rebase origin/main
+            sleep 3
+          done
