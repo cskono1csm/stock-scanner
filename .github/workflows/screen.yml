@@ -27,7 +27,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Run screener (KR + US)
         run: python main.py
-           - name: Commit updated dashboard
+      - name: Commit updated dashboard
         run: |
           git config user.name "stock-screener-bot"
           git config user.email "actions@users.noreply.github.com"
