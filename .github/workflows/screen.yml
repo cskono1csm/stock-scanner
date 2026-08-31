@@ -2,7 +2,7 @@ name: Stock Screening
 
 on:
   schedule:
-    - cron: "30 22 * * 0-4"
+    - cron: "30 22 * * 0-5"
   workflow_dispatch: {}
 
 permissions:
