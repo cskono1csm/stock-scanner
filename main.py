@@ -262,13 +262,27 @@ def fetch_macro_indicators() -> dict:
     """기준금리·환율·원자재 가격을 FRED CSV 엔드포인트에서 가져옵니다(참고 표시 전용,
     스코어링에는 전혀 반영하지 않음). 시리즈 하나가 실패해도 나머지에는 영향이 없도록
     항목별로 개별 예외 처리합니다 - 이 프로젝트의 다른 외부 데이터 수집과 동일한 원칙입니다."""
+    # FRED의 CSV 다운로드 엔드포인트는 브라우저 User-Agent가 없는 요청(파이썬 requests 기본
+    # User-Agent 등)을 차단/거부하는 경우가 있어(2026.09.11, GitHub Actions 운영 환경에서 매크로
+    # 지표 전체가 항상 실패하는 문제로 실제 확인됨), 이 프로젝트의 다른 크롤링(get_sp500_tickers의
+    # 위키피디아 요청)과 동일한 크롬 브라우저 User-Agent를 명시적으로 붙입니다.
+    _FRED_HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
     result = {}
     for key, label, series_id, _ in MACRO_SERIES:
         try:
             resp = requests.get(
-                f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}", timeout=10,
+                f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}",
+                headers=_FRED_HEADERS, timeout=15,
             )
             resp.raise_for_status()
+            # 디버그: 응답이 기대한 CSV가 아니라 로그인/차단 페이지 등으로 바뀐 경우를 바로
+            # 알아볼 수 있도록 실패 원인 진단에 필요한 최소 정보만 남깁니다.
+            preview = resp.text[:80].replace("\n", " ")
+            print(f"[MACRO-DEBUG] {label}({series_id}) 응답 상태={resp.status_code}, "
+                  f"길이={len(resp.text)}자, 시작부분='{preview}'")
             df = pd.read_csv(io.StringIO(resp.text))
             df.columns = [c.strip() for c in df.columns]
             series = pd.to_numeric(df[series_id], errors="coerce").dropna()
@@ -280,9 +294,11 @@ def fetch_macro_indicators() -> dict:
                     "as_of": str(df.loc[last_idx, date_col]),
                 }
             else:
+                print(f"[MACRO] {label}({series_id}): CSV는 받았으나 유효한 숫자 값이 없음")
                 result[key] = {"label": label, "value": None, "as_of": None}
         except Exception as e:
-            print(f"[MACRO] {label}({series_id}) 조회 실패(참고용 항목이라 무시하고 계속 진행): {e}")
+            print(f"[MACRO] {label}({series_id}) 조회 실패(참고용 항목이라 무시하고 계속 진행): "
+                  f"{type(e).__name__}: {e}")
             result[key] = {"label": label, "value": None, "as_of": None}
     return result
 
@@ -784,8 +800,10 @@ def _fetch_naver_profiles_parallel(codes, max_workers=NAVER_MAX_WORKERS) -> dict
                                       max_workers=max_workers, label="NAVER-PROFILE")
 
 
-_ratio_debug_done = False
-
+_ratio_debug_count = 0
+_RATIO_DEBUG_LIMIT = 3  # 첫 N개 종목까지 상세 로그를 남겨(1개만으로는 우연/일시적 실패와
+                        # 구조적 실패를 구분하기 어려웠던 과거 경험 반영) 다음 실행에서 원인을
+                        # 더 정확히 진단할 수 있게 합니다.
 
 _EMPTY_NAVER_FINANCIALS = {
     "ROE": np.nan, "부채비율": np.nan,
@@ -793,86 +811,129 @@ _EMPTY_NAVER_FINANCIALS = {
     "매출성장률": np.nan, "영업이익성장률": np.nan,
 }
 
+# 이 표를 제공하는 실제 백엔드는 네이버금융이 아니라 WiseReport(navercomp.wisereport.co.kr)이며,
+# 이 프로젝트에서 사업개요 스크래핑(_fetch_naver_company_profile)이 바로 이 호스트를 이미
+# 문제없이 쓰고 있습니다(cF1001.aspx는 companyinfo.stock.naver.com의 AJAX 엔드포인트가 내부적으로
+# 그대로 프록시하는 WiseReport 원본 페이지). 2026.09.11 라이브 점검에서 companyinfo.stock.naver.com
+# 경로로는 한국 종목 전체(10개 테마 전부)에서 매출액/영업이익이 하나도 안 잡히는 것이 확인돼,
+# 이미 검증된 wisereport 호스트를 1순위로 쓰고, 혹시를 대비해 기존 경로를 2순위 폴백으로 둡니다.
+_RATIO_SOURCES = [
+    ("wisereport", "https://navercomp.wisereport.co.kr/v2/company/cF1001.aspx",
+     "https://navercomp.wisereport.co.kr/v2/company/c1010001.aspx?cmp_cd={code}"),
+    ("companyinfo", "https://companyinfo.stock.naver.com/v1/company/ajax/cF1001.aspx",
+     "https://finance.naver.com/"),
+]
+
+
+def _parse_naver_financial_table(resp_text: str) -> dict:
+    """cF1001.aspx류 응답(HTML 표)에서 ROE/부채비율/매출액/영업이익(및 전년 대비 성장률)을
+    추출하는 공용 파싱 로직입니다. 소스 호스트(wisereport/companyinfo)가 달라도 표 형식은
+    동일해 파싱 함수를 공유합니다."""
+    result = dict(_EMPTY_NAVER_FINANCIALS)
+    tables = pd.read_html(io.StringIO(resp_text))
+    if not tables:
+        return result
+    table = tables[0]
+    first_col = table.iloc[:, 0].astype(str)
+
+    def _row_numbers(row_idx):
+        row = table.iloc[row_idx, 1:]
+        nums = pd.to_numeric(
+            row.astype(str).str.replace(",", "").str.replace("%", "").str.strip(),
+            errors="coerce",
+        ).dropna()
+        return list(nums)
+
+    def _last_numeric(row_idx):
+        nums = _row_numbers(row_idx)
+        return float(nums[-1]) if nums else np.nan
+
+    def _yoy_growth(row_idx):
+        """맨 뒤 두 시점(가장 최근 확정치 기준)으로 전년 대비 증감률을 "비율"(예: 8%
+        성장 -> 0.08)로 계산합니다. yfinance의 revenueGrowth 등 이 프로젝트의 다른 모든
+        성장률 컬럼과 단위를 맞춰야 _fmt_pct()(내부에서 *100을 해 "%"로 표시) 등
+        공용 포맷 함수를 그대로 재사용할 수 있습니다(퍼센트로 이미 변환해서 반환하면
+        화면에 8%가 아니라 800%로 표시되는 단위 중복 버그가 납니다).
+        직전 값이 0이거나 부호가 바뀌는 경우(적자->흑자 등)는 비율 자체가 의미가 없어
+        NaN으로 둡니다."""
+        nums = _row_numbers(row_idx)
+        if len(nums) < 2:
+            return np.nan, (nums[-1] if nums else np.nan)
+        prev, latest = nums[-2], nums[-1]
+        if prev == 0 or (prev < 0) != (latest < 0):
+            return np.nan, latest
+        return (latest - prev) / abs(prev), latest
+
+    for i, label in first_col.items():
+        label_norm = label.replace(" ", "")
+        if pd.isna(result["ROE"]) and "ROE" in label.upper():
+            result["ROE"] = _last_numeric(i)
+        elif pd.isna(result["부채비율"]) and "부채비율" in label_norm:
+            result["부채비율"] = _last_numeric(i)
+        elif pd.isna(result["매출액"]) and label_norm.startswith("매출액"):
+            growth, latest = _yoy_growth(i)
+            result["매출액"], result["매출성장률"] = latest, growth
+        elif pd.isna(result["영업이익"]) and label_norm.startswith("영업이익") \
+                and "률" not in label_norm:
+            growth, latest = _yoy_growth(i)
+            result["영업이익"], result["영업이익성장률"] = latest, growth
+    return result
+
 
 def _fetch_naver_financial_ratio(code: str) -> dict:
-    """네이버금융 산하 기업정보(companyinfo.stock.naver.com)의 연간 실적 요약 표에서
-    ROE·부채비율(참고용)과 매출액·영업이익(및 전년 대비 성장률 - 2026.09.11부터 "정책 관련
-    섹터 안에서 매출·영업이익 실적 기준으로 추천"의 핵심 데이터로 사용)을 함께 수집합니다.
+    """연간 실적 요약 표에서 ROE·부채비율(참고용)과 매출액·영업이익(및 전년 대비 성장률 -
+    2026.09.11부터 "정책 관련 섹터 안에서 매출·영업이익 실적 기준으로 추천"의 핵심 데이터로
+    사용)을 함께 수집합니다.
 
-    이 표는 보통 종목별로 연도 컬럼이 여러 개(작년/올해/추정치 등) 나열된 형태입니다. 정확한
-    컬럼 순서/개수는 종목마다, 그리고 이 세션에서는 라이브로 직접 확인할 방법이 없어(외부망
-    차단) 다를 수 있어, "레이블 텍스트가 포함된 행에서 왼쪽부터 유효한 숫자를 순서대로 모두
-    추출한 뒤, 맨 뒤 두 개(가장 최근 두 시점)로 증감률을 계산"하는 방식으로 표 구조 변화에
-    최대한 강건하게 만들었습니다. 그래도 실패하면 NaN만 반환하고 예외를 던지지 않습니다 -
-    ROE/부채비율은 여전히 참고 표시용이라 실패해도 무방하지만, 매출액/영업이익(성장률)은
-    이제 정책테마 섹션 순위에 쓰이므로 이 값이 자주 비면 그 섹션 정확도가 떨어집니다. 다음
-    실행 로그의 [DEBUG-RATIO] 줄로 실제 파싱 성공 여부를 확인하세요."""
-    global _ratio_debug_done
-    result = dict(_EMPTY_NAVER_FINANCIALS)
-    try:
-        resp = requests.get(
-            "https://companyinfo.stock.naver.com/v1/company/ajax/cF1001.aspx",
-            params={"cmp_cd": code, "fin_typ": "0", "freq_typ": "Y"},
-            headers={"Referer": "https://finance.naver.com/"},
-            timeout=10,
-        )
-        tables = pd.read_html(io.StringIO(resp.text))
-        if tables:
-            table = tables[0]
-            first_col = table.iloc[:, 0].astype(str)
+    2026.09.11 라이브 점검 결과 기존 companyinfo.stock.naver.com 경로가 실제 운영(GitHub
+    Actions) 환경에서 한국 종목 전체에 대해 데이터를 하나도 못 가져오는 것이 확인돼, 이 프로젝트
+    안에서 이미 검증된 wisereport 호스트(사업개요 스크래핑과 동일 도메인)를 1순위로, 기존 경로를
+    2순위 폴백으로 시도하도록 바꿨습니다 - User-Agent 헤더도 함께 추가했습니다(이 세션에서 직접
+    확인한 FRED 사례처럼, 브라우저 UA가 없는 요청을 차단하는 서버가 드물지 않기 때문입니다).
 
-            def _row_numbers(row_idx):
-                row = table.iloc[row_idx, 1:]
-                nums = pd.to_numeric(
-                    row.astype(str).str.replace(",", "").str.replace("%", "").str.strip(),
-                    errors="coerce",
-                ).dropna()
-                return list(nums)
-
-            def _last_numeric(row_idx):
-                nums = _row_numbers(row_idx)
-                return float(nums[-1]) if nums else np.nan
-
-            def _yoy_growth(row_idx):
-                """맨 뒤 두 시점(가장 최근 확정치 기준)으로 전년 대비 증감률을 "비율"(예: 8%
-                성장 -> 0.08)로 계산합니다. yfinance의 revenueGrowth 등 이 프로젝트의 다른 모든
-                성장률 컬럼과 단위를 맞춰야 _fmt_pct()(내부에서 *100을 해 "%"로 표시) 등
-                공용 포맷 함수를 그대로 재사용할 수 있습니다(퍼센트로 이미 변환해서 반환하면
-                화면에 8%가 아니라 800%로 표시되는 단위 중복 버그가 납니다).
-                직전 값이 0이거나 부호가 바뀌는 경우(적자->흑자 등)는 비율 자체가 의미가 없어
-                NaN으로 둡니다."""
-                nums = _row_numbers(row_idx)
-                if len(nums) < 2:
-                    return np.nan, (nums[-1] if nums else np.nan)
-                prev, latest = nums[-2], nums[-1]
-                if prev == 0 or (prev < 0) != (latest < 0):
-                    return np.nan, latest
-                return (latest - prev) / abs(prev), latest
-
-            for i, label in first_col.items():
-                label_norm = label.replace(" ", "")
-                if pd.isna(result["ROE"]) and "ROE" in label.upper():
-                    result["ROE"] = _last_numeric(i)
-                elif pd.isna(result["부채비율"]) and "부채비율" in label_norm:
-                    result["부채비율"] = _last_numeric(i)
-                elif pd.isna(result["매출액"]) and label_norm.startswith("매출액"):
-                    growth, latest = _yoy_growth(i)
-                    result["매출액"], result["매출성장률"] = latest, growth
-                elif pd.isna(result["영업이익"]) and label_norm.startswith("영업이익") \
-                        and "률" not in label_norm:
-                    growth, latest = _yoy_growth(i)
-                    result["영업이익"], result["영업이익성장률"] = latest, growth
-        if not _ratio_debug_done:
-            _ratio_debug_done = True
-            print(f"[DEBUG-RATIO] {code} status={resp.status_code} 결과={result}")
-            if all(pd.isna(v) for v in result.values()):
-                print(f"[DEBUG-RATIO] 재무정보 행을 하나도 못 찾음(표 구조가 예상과 다를 수 "
-                      f"있음). 응답 앞부분={resp.text[:500]!r}")
-    except Exception as e:
-        if not _ratio_debug_done:
-            _ratio_debug_done = True
-            print(f"[DEBUG-RATIO] {code} 요청/파싱 실패: {e}")
-    return result
+    표 컬럼 순서/개수는 종목마다 다를 수 있어 "레이블 텍스트가 포함된 행에서 왼쪽부터 유효한
+    숫자를 순서대로 모두 추출한 뒤, 맨 뒤 두 개(가장 최근 두 시점)로 증감률을 계산"하는 방식으로
+    표 구조 변화에 최대한 강건하게 만들었습니다. 두 소스 모두 실패하면 NaN만 반환하고 예외를
+    던지지 않습니다. 처음 몇 종목은 [DEBUG-RATIO] 로그로 실제 응답을 남겨 다음 실행에서 원인을
+    더 정확히 진단할 수 있게 합니다."""
+    global _ratio_debug_count
+    should_debug = _ratio_debug_count < _RATIO_DEBUG_LIMIT
+    if should_debug:
+        _ratio_debug_count += 1
+    headers_base = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    }
+    last_status, last_preview, last_source = None, "", None
+    for source_name, url, referer_or_template in _RATIO_SOURCES:
+        try:
+            referer = referer_or_template.format(code=code) if "{code}" in referer_or_template \
+                else referer_or_template
+            headers = dict(headers_base, Referer=referer)
+            resp = requests.get(
+                url, params={"cmp_cd": code, "fin_typ": "0", "freq_typ": "Y"},
+                headers=headers, timeout=10,
+            )
+            last_status, last_source = resp.status_code, source_name
+            last_preview = resp.text[:300].replace("\n", " ")
+            result = _parse_naver_financial_table(resp.text)
+            got_core_data = pd.notna(result["매출액"]) or pd.notna(result["영업이익"])
+            if should_debug:
+                print(f"[DEBUG-RATIO] {code} source={source_name} status={resp.status_code} "
+                      f"결과={result}")
+            if got_core_data:
+                return result
+            elif should_debug:
+                print(f"[DEBUG-RATIO] {code} source={source_name}: 매출액/영업이익 모두 못 찾음, "
+                      f"다음 소스로 폴백 시도. 응답 앞부분={last_preview!r}")
+        except Exception as e:
+            if should_debug:
+                print(f"[DEBUG-RATIO] {code} source={source_name} 요청/파싱 실패: "
+                      f"{type(e).__name__}: {e}")
+    if should_debug:
+        print(f"[DEBUG-RATIO] {code}: 모든 소스 실패, NaN으로 채움 (마지막 시도={last_source}, "
+              f"status={last_status}, 응답 앞부분={last_preview!r})")
+    return dict(_EMPTY_NAVER_FINANCIALS)
 
 
 def _fetch_naver_financial_ratios_parallel(codes, max_workers=NAVER_MAX_WORKERS) -> dict:
